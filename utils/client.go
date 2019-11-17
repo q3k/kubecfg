@@ -19,7 +19,7 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/googleapis/gnostic/OpenAPIv2"
+	openapi_v2 "github.com/googleapis/gnostic/OpenAPIv2"
 	log "github.com/sirupsen/logrus"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -28,7 +28,7 @@ import (
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
-	"k8s.io/kubernetes/pkg/kubectl/cmd/util/openapi"
+	"k8s.io/kubectl/pkg/util/openapi"
 )
 
 type memcachedDiscoveryClient struct {
@@ -100,6 +100,10 @@ func (c *memcachedDiscoveryClient) ServerGroups() (*metav1.APIGroupList, error) 
 	}
 	c.servergroups, err = c.cl.ServerGroups()
 	return c.servergroups, err
+}
+
+func (c *memcachedDiscoveryClient) ServerGroupsAndResources() ([]*metav1.APIGroup, []*metav1.APIResourceList, error) {
+	return discovery.ServerGroupsAndResources(c)
 }
 
 func (c *memcachedDiscoveryClient) ServerResourcesForGroupVersion(groupVersion string) (*metav1.APIResourceList, error) {
