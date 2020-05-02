@@ -24,11 +24,13 @@ import (
 const (
 	flagDiffStrategy = "diff-strategy"
 	flagOmitSecrets  = "omit-secrets"
+	flagOmitSame     = "omit-same"
 )
 
 func init() {
 	diffCmd.PersistentFlags().String(flagDiffStrategy, "all", "Diff strategy, all or subset.")
 	diffCmd.PersistentFlags().Bool(flagOmitSecrets, false, "hide secret details when showing diff")
+	diffCmd.PersistentFlags().Bool(flagOmitSame, false, "be quiet about objects that haven't changed")
 	RootCmd.AddCommand(diffCmd)
 }
 
@@ -48,6 +50,11 @@ var diffCmd = &cobra.Command{
 		}
 
 		c.OmitSecrets, err = flags.GetBool(flagOmitSecrets)
+		if err != nil {
+			return err
+		}
+
+		c.OmitSame, err = flags.GetBool(flagOmitSame)
 		if err != nil {
 			return err
 		}

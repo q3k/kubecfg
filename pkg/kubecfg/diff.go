@@ -49,66 +49,135 @@ type DiffCmd struct {
 	Mapper           meta.RESTMapper
 	DefaultNamespace string
 	OmitSecrets      bool
+	OmitSame         bool
 
 	DiffStrategy string
+}
+
+// difference is one of the possible states of a comparison between a local and remote object
+type difference int64
+
+const (
+	// No difference between local and remote object
+	differenceNone difference = iota
+	// Could not get difference due to an error
+	differenceError
+	// Object does not exist on remote but exists locally
+	differenceOnlyLocal
+	// Object exists both remote and locally, but is diffirent
+	differenceDifferent
+)
+
+// diffRes is the result of a comparison of a local vs. remote object.
+type diffRes struct {
+	// The name of the resource that was compared.
+	desc string
+	// The difference type.
+	diff difference
+	// If difference is differenceDifferent, the text diff of the two objects.
+	details string
+	// If difference is differenceError, the error that occured when performing the comparison.
+	err error
+}
+
+// diffOne performs a comparison of a local object vs an object on the
+// DiffCmd's Client remote.
+func (c DiffCmd) diffOne(obj *unstructured.Unstructured) *diffRes {
+	dmp := diffmatchpatch.New()
+
+	desc := fmt.Sprintf("%s %s", utils.ResourceNameFor(c.Mapper, obj), utils.FqName(obj))
+
+	fatal := func(err error) *diffRes {
+		return &diffRes{
+			desc: desc,
+			diff: differenceError,
+			err:  err,
+		}
+	}
+	result := func(diff difference, details string) *diffRes {
+		return &diffRes{
+			desc:    desc,
+			diff:    diff,
+			details: details,
+		}
+	}
+
+	log.Debug("Fetching ", desc)
+	client, err := utils.ClientForResource(c.Client, c.Mapper, obj, c.DefaultNamespace)
+	if err != nil {
+		return fatal(err)
+	}
+
+	if obj.GetName() == "" {
+		return fatal(fmt.Errorf("Error fetching one of the %s: it does not have a name set", utils.ResourceNameFor(c.Mapper, obj)))
+	}
+
+	liveObj, err := client.Get(obj.GetName(), metav1.GetOptions{})
+	if err != nil && errors.IsNotFound(err) {
+		log.Debugf("%s doesn't exist on the server", desc)
+		liveObj = nil
+	} else if err != nil {
+		return fatal(fmt.Errorf("Error fetching %s: %v", desc, err))
+	}
+
+	if liveObj == nil {
+		return result(differenceOnlyLocal, "")
+	}
+
+	liveObjObject := liveObj.Object
+	if c.DiffStrategy == "subset" {
+		liveObjObject = removeMapFields(obj.Object, liveObjObject)
+	}
+
+	liveObjText, _ := json.MarshalIndent(liveObjObject, "", "  ")
+	objText, _ := json.MarshalIndent(obj.Object, "", "  ")
+
+	liveObjTextLines, objTextLines, lines := dmp.DiffLinesToChars(string(liveObjText), string(objText))
+
+	diff := dmp.DiffMain(
+		string(liveObjTextLines),
+		string(objTextLines),
+		false)
+
+	diff = dmp.DiffCharsToLines(diff, lines)
+	if (len(diff) == 1) && (diff[0].Type == diffmatchpatch.DiffEqual) {
+		return result(differenceNone, "")
+	}
+
+	details := c.formatDiff(diff, isatty.IsTerminal(os.Stdout.Fd()), c.OmitSecrets && obj.GetKind() == "Secret")
+	return result(differenceDifferent, details)
 }
 
 func (c DiffCmd) Run(apiObjects []*unstructured.Unstructured, out io.Writer) error {
 	sort.Sort(utils.AlphabeticalOrder(apiObjects))
 
-	dmp := diffmatchpatch.New()
 	diffFound := false
 	for _, obj := range apiObjects {
-		desc := fmt.Sprintf("%s %s", utils.ResourceNameFor(c.Mapper, obj), utils.FqName(obj))
-		log.Debug("Fetching ", desc)
+		o := c.diffOne(obj)
 
-		client, err := utils.ClientForResource(c.Client, c.Mapper, obj, c.DefaultNamespace)
-		if err != nil {
-			return err
+		printObjectHeader := func() {
+			fmt.Fprintln(out, "---")
+			fmt.Fprintf(out, "- live %s\n+ config %s\n", o.desc, o.desc)
 		}
 
-		if obj.GetName() == "" {
-			return fmt.Errorf("Error fetching one of the %s: it does not have a name set", utils.ResourceNameFor(c.Mapper, obj))
-		}
+		switch o.diff {
+		case differenceNone:
+			if !c.OmitSame {
+				printObjectHeader()
+			}
 
-		liveObj, err := client.Get(obj.GetName(), metav1.GetOptions{})
-		if err != nil && errors.IsNotFound(err) {
-			log.Debugf("%s doesn't exist on the server", desc)
-			liveObj = nil
-		} else if err != nil {
-			return fmt.Errorf("Error fetching %s: %v", desc, err)
-		}
+		case differenceError:
+			fmt.Fprintf(out, "%v\n", o.err)
 
-		fmt.Fprintln(out, "---")
-		fmt.Fprintf(out, "- live %s\n+ config %s\n", desc, desc)
-		if liveObj == nil {
-			fmt.Fprintf(out, "%s doesn't exist on server\n", desc)
+		case differenceOnlyLocal:
 			diffFound = true
-			continue
-		}
+			printObjectHeader()
+			fmt.Fprintf(out, "%s doesn't exist on server\n", o.desc)
 
-		liveObjObject := liveObj.Object
-		if c.DiffStrategy == "subset" {
-			liveObjObject = removeMapFields(obj.Object, liveObjObject)
-		}
-
-		liveObjText, _ := json.MarshalIndent(liveObjObject, "", "  ")
-		objText, _ := json.MarshalIndent(obj.Object, "", "  ")
-
-		liveObjTextLines, objTextLines, lines := dmp.DiffLinesToChars(string(liveObjText), string(objText))
-
-		diff := dmp.DiffMain(
-			string(liveObjTextLines),
-			string(objTextLines),
-			false)
-
-		diff = dmp.DiffCharsToLines(diff, lines)
-		if (len(diff) == 1) && (diff[0].Type == diffmatchpatch.DiffEqual) {
-			fmt.Fprintf(out, "%s unchanged\n", desc)
-		} else {
+		case differenceDifferent:
 			diffFound = true
-			text := c.formatDiff(diff, isatty.IsTerminal(os.Stdout.Fd()), c.OmitSecrets && obj.GetKind() == "Secret")
-			fmt.Fprintf(out, "%s\n", text)
+			printObjectHeader()
+			fmt.Fprintf(out, "%s\n", o.details)
 		}
 	}
 
